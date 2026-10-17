@@ -803,7 +803,7 @@
     }
     renderMoves(); updateStatus();
     ui.undo.disabled = !gameMoves.length;
-    ui.resign.disabled = gameOver;
+    ui.resign.disabled = gameOver || !clockStarted;
     renderClocks();
   }
 
@@ -1075,7 +1075,7 @@
   }
 
   function resignGame() {
-    if (gameOver) return;
+    if (gameOver || !clockStarted) return;
     if (!tickClock()) return;
     if (window.confirm('確定要投降並結束本局嗎？')) setFinalStatus({ type: 'resign', winner: 'b' });
     else clockLast = performance.now();
