@@ -844,10 +844,10 @@
       const ctx = audioContext;
       const now = ctx.currentTime;
       const master = ctx.createGain();
-      master.gain.setValueAtTime(0.82,now);
+      master.gain.setValueAtTime(1.35,now);
       const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.setValueAtTime(-20,now);
-      compressor.ratio.setValueAtTime(5,now);
+      compressor.threshold.setValueAtTime(-12,now);
+      compressor.ratio.setValueAtTime(3.5,now);
       master.connect(compressor); compressor.connect(ctx.destination);
 
       function impact(delay, strength, pitch) {
