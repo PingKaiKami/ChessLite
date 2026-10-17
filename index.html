@@ -274,9 +274,9 @@
         </div>
         <label for="difficulty">AI 難度</label>
         <select id="difficulty">
-          <option value="easy">簡單（1 層）</option>
-          <option value="medium" selected>中等（2 層）</option>
-          <option value="hard">困難（3 層）</option>
+          <option value="easy">簡單（快速）</option>
+          <option value="medium" selected>中等（迭代加深）</option>
+          <option value="hard">困難（深度搜尋）</option>
         </select>
         <p id="difficultyHelp" class="help">難度會在下一局套用；目前：中等</p>
         <div class="actions">
@@ -345,7 +345,19 @@
   function positionKey(state) {
     const rows = state.board.map(row => row.map(p => p ? (p.color === 'w' ? p.type.toUpperCase() : p.type) : '.').join('')).join('/');
     const rights = Object.keys(state.castling).filter(k => state.castling[k]).join('') || '-';
-    const ep = state.enPassant ? squareName(state.enPassant.r, state.enPassant.c) : '-';
+    let ep = '-';
+    if (state.enPassant) {
+      const fromRow = state.enPassant.r + (state.turn === 'w' ? 1 : -1);
+      for (const dc of [-1, 1]) {
+        const fromCol = state.enPassant.c + dc;
+        if (!inside(fromRow,fromCol)) continue;
+        const pawn = state.board[fromRow][fromCol];
+        const victim = state.board[fromRow][state.enPassant.c];
+        if (!pawn || pawn.color !== state.turn || pawn.type !== 'p' || !victim || victim.color === state.turn || victim.type !== 'p') continue;
+        const move = { from:{r:fromRow,c:fromCol}, to:{...state.enPassant}, enPassant:true };
+        if (!inCheck(applyMove(state,move,false),state.turn)) { ep = squareName(state.enPassant.r,state.enPassant.c); break; }
+      }
+    }
     return `${rows} ${state.turn} ${rights} ${ep}`;
   }
 
@@ -570,16 +582,39 @@
 
   function evaluate(state) {
     let score = 0;
+    let nonPawnMaterial = 0;
+    const bishops = { w: 0, b: 0 };
+    const pawnFiles = { w: Array(8).fill(0), b: Array(8).fill(0) };
     for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) {
       const p = state.board[r][c];
       if (!p) continue;
       const idx = p.color === 'w' ? r * 8 + c : (7-r) * 8 + c;
       const value = VALUES[p.type] + PST[p.type][idx];
       score += p.color === 'b' ? value : -value;
+      if (!['p','k'].includes(p.type)) nonPawnMaterial += VALUES[p.type];
+      if (p.type === 'b') bishops[p.color]++;
+      if (p.type === 'p') pawnFiles[p.color][c]++;
+    }
+    if (bishops.b >= 2) score += 28;
+    if (bishops.w >= 2) score -= 28;
+    for (const color of ['w','b']) for (let c = 0; c < 8; c++) {
+      if (pawnFiles[color][c] > 1) score += (color === 'b' ? -1 : 1) * 14 * (pawnFiles[color][c] - 1);
+      if (pawnFiles[color][c] && !pawnFiles[color][c-1] && !pawnFiles[color][c+1]) score += (color === 'b' ? -1 : 1) * 10;
+    }
+    for (const color of ['w','b']) {
+      const king = findKing(state,color);
+      if (!king) continue;
+      const sign = color === 'b' ? 1 : -1;
+      const home = color === 'w' ? 7 : 0;
+      if (king.r === home && (king.c === 2 || king.c === 6)) score += sign * 35;
+      if (nonPawnMaterial < 2200) {
+        const centerDistance = Math.abs(king.r - 3.5) + Math.abs(king.c - 3.5);
+        score += sign * (28 - centerDistance * 6);
+      }
     }
     const side = state.turn;
     const mobility = allLegalMoves(state).length;
-    score += (side === 'b' ? 1 : -1) * mobility * 2;
+    score += (side === 'b' ? 1 : -1) * mobility * 1.5;
     if (inCheck(state,'w')) score += 22;
     if (inCheck(state,'b')) score -= 22;
     return score;
@@ -588,42 +623,129 @@
   function moveOrderScore(state, move) {
     const target = move.enPassant ? { type: 'p' } : state.board[move.to.r][move.to.c];
     const mover = state.board[move.from.r][move.from.c];
-    return (target ? VALUES[target.type] * 10 - VALUES[mover.type] : 0) + (move.promotion ? VALUES[move.promotion] : 0) + (move.castle ? 40 : 0);
+    return (target ? VALUES[target.type] * 12 - VALUES[mover.type] : 0) + (move.promotion ? VALUES[move.promotion] * 2 : 0) + (move.castle ? 80 : 0);
   }
 
-  function chooseAiMove(state, difficulty) {
-    const depth = { easy: 1, medium: 2, hard: 3 }[difficulty];
-    const deadline = performance.now() + ({ easy: 250, medium: 900, hard: 2600 }[difficulty]);
+  function chooseAiMove(state, difficulty, limits = {}) {
+    const settings = {
+      easy: { maxDepth: 2, time: 450, nodes: 45000 },
+      medium: { maxDepth: 4, time: 1800, nodes: 240000 },
+      hard: { maxDepth: 6, time: 5000, nodes: 900000 }
+    }[difficulty];
+    const maxDepth = limits.maxDepth || settings.maxDepth;
+    const deadline = performance.now() + (limits.time || settings.time);
+    const maxNodes = limits.nodes || settings.nodes;
+    const table = new Map();
+    const TIMEOUT = {};
+    const MATE = 1000000;
     let nodes = 0;
-    function search(pos, remaining, alpha, beta) {
+
+    function guard() {
       nodes++;
-      const result = gameResult(pos);
-      if (result.over) {
-        if (result.type === 'checkmate') return result.winner === 'b' ? 100000 + remaining : -100000 - remaining;
-        return 0;
-      }
-      if (remaining === 0 || nodes > 65000 || performance.now() > deadline) return evaluate(pos);
+      if (nodes > maxNodes || ((nodes & 255) === 0 && performance.now() >= deadline)) throw TIMEOUT;
+    }
+
+    function terminalScore(result, ply) {
+      if (result.type !== 'checkmate') return 0;
+      return result.winner === 'b' ? MATE - ply : -MATE + ply;
+    }
+
+    function signature(move) {
+      return `${move.from.r}${move.from.c}${move.to.r}${move.to.c}${move.promotion || ''}`;
+    }
+
+    function orderedMoves(pos, moves, preferred = '') {
+      return moves.sort((a,b) => {
+        const pa = signature(a) === preferred ? 100000 : 0;
+        const pb = signature(b) === preferred ? 100000 : 0;
+        return pb + moveOrderScore(pos,b) - pa - moveOrderScore(pos,a);
+      });
+    }
+
+    function quiescence(pos, alpha, beta, ply, remaining = 3, knownResult = null) {
+      guard();
+      const result = knownResult || gameResult(pos);
+      if (result.over) return terminalScore(result,ply);
       const maximizing = pos.turn === 'b';
-      let best = maximizing ? -Infinity : Infinity;
-      const moves = result.moves.sort((a,b) => moveOrderScore(pos,b) - moveOrderScore(pos,a));
-      for (const move of moves) {
-        const value = search(applyMove(pos,move), remaining - 1, alpha, beta);
+      const checked = result.check;
+      const standPat = evaluate(pos);
+      let best = checked ? (maximizing ? -Infinity : Infinity) : standPat;
+      if (!checked) {
+        if (maximizing) { if (best >= beta) return best; alpha = Math.max(alpha,best); }
+        else { if (best <= alpha) return best; beta = Math.min(beta,best); }
+      }
+      if (remaining <= 0) return standPat;
+      const tactical = checked ? result.moves : result.moves.filter(move => move.enPassant || move.promotion || pos.board[move.to.r][move.to.c]);
+      if (!tactical.length) return best;
+      for (const move of orderedMoves(pos,tactical)) {
+        const value = quiescence(applyMove(pos,move),alpha,beta,ply+1,remaining-1);
         if (maximizing) { best = Math.max(best,value); alpha = Math.max(alpha,best); }
         else { best = Math.min(best,value); beta = Math.min(beta,best); }
-        if (beta <= alpha || performance.now() > deadline) break;
+        if (beta <= alpha) break;
       }
       return best;
     }
-    const moves = allLegalMoves(state).sort((a,b) => moveOrderScore(state,b) - moveOrderScore(state,a));
-    let bestScore = -Infinity, choices = [];
-    for (const move of moves) {
-      let score = search(applyMove(state,move), depth - 1, -Infinity, Infinity);
-      if (difficulty === 'easy') score += (Math.random() - .5) * 120;
-      if (score > bestScore) { bestScore = score; choices = [move]; }
-      else if (score === bestScore) choices.push(move);
-      if (performance.now() > deadline && choices.length) break;
+
+    function search(pos, depth, alpha, beta, ply, extensions = 0) {
+      guard();
+      const result = gameResult(pos);
+      if (result.over) return terminalScore(result,ply);
+      if (depth <= 0) return quiescence(pos,alpha,beta,ply,3,result);
+      const repetitionCount = pos.positionCounts.get(positionKey(pos)) || 0;
+      const key = `${positionKey(pos)}|${pos.halfmove}|${repetitionCount}`;
+      const cached = table.get(key);
+      const alphaStart = alpha, betaStart = beta;
+      if (cached && cached.depth >= depth) {
+        if (cached.flag === 'exact') return cached.score;
+        if (cached.flag === 'lower') alpha = Math.max(alpha,cached.score);
+        if (cached.flag === 'upper') beta = Math.min(beta,cached.score);
+        if (alpha >= beta) return cached.score;
+      }
+      const maximizing = pos.turn === 'b';
+      let best = maximizing ? -Infinity : Infinity;
+      let bestMove = null;
+      for (const move of orderedMoves(pos,result.moves,cached?.best || '')) {
+        const child = applyMove(pos,move);
+        const givesCheck = inCheck(child,child.turn);
+        const extension = givesCheck && extensions < 2 && depth <= 2 ? 1 : 0;
+        const value = search(child,depth-1+extension,alpha,beta,ply+1,extensions+extension);
+        if ((maximizing && value > best) || (!maximizing && value < best)) { best = value; bestMove = move; }
+        if (maximizing) alpha = Math.max(alpha,best); else beta = Math.min(beta,best);
+        if (beta <= alpha) break;
+      }
+      const flag = best <= alphaStart ? 'upper' : best >= betaStart ? 'lower' : 'exact';
+      table.set(key,{ depth, score:best, flag, best:bestMove ? signature(bestMove) : '' });
+      return best;
     }
-    return choices[Math.floor(Math.random() * choices.length)] || moves[0];
+
+    const rootMoves = allLegalMoves(state);
+    if (!rootMoves.length) return null;
+    let bestMove = rootMoves[0];
+    let finalScores = [{ move:bestMove, score:-Infinity }];
+    for (let depth = 1; depth <= maxDepth; depth++) {
+      try {
+        const scores = [];
+        let alpha = -Infinity;
+        for (const move of orderedMoves(state,[...rootMoves],signature(bestMove))) {
+          const score = search(applyMove(state,move),depth-1,alpha,Infinity,1);
+          scores.push({ move, score });
+          alpha = Math.max(alpha,score);
+        }
+        scores.sort((a,b) => b.score-a.score);
+        finalScores = scores;
+        bestMove = scores[0].move;
+        if (scores[0].score > MATE - 100) break;
+      } catch (error) {
+        if (error !== TIMEOUT) throw error;
+        break;
+      }
+      if (performance.now() >= deadline) break;
+    }
+    if (difficulty === 'easy') {
+      const nearBest = finalScores.filter(item => item.score >= finalScores[0].score - 100).slice(0,4);
+      return nearBest[Math.floor(Math.random()*nearBest.length)]?.move || bestMove;
+    }
+    return bestMove;
   }
 
   function pieceSvg(type, color) {
@@ -652,6 +774,7 @@
   let selected = null, selectedMoves = [], gameMoves = [], gameOver = false, aiThinking = false, gameToken = 0;
   let drag = null, suppressClick = false;
   let clocks = { w: 10 * 60 * 1000, b: 10 * 60 * 1000 };
+  let clockStarted = false;
   let clockLast = performance.now();
   let audioContext = null;
 
@@ -692,13 +815,13 @@
   function renderClocks() {
     ui.whiteClock.textContent = formatClock(clocks.w);
     ui.blackClock.textContent = formatClock(clocks.b);
-    ui.whiteClockBox.classList.toggle('active', !gameOver && state.turn === 'w');
-    ui.blackClockBox.classList.toggle('active', !gameOver && state.turn === 'b');
+    ui.whiteClockBox.classList.toggle('active', clockStarted && !gameOver && state.turn === 'w');
+    ui.blackClockBox.classList.toggle('active', clockStarted && !gameOver && state.turn === 'b');
   }
 
   function tickClock() {
     const now = performance.now();
-    if (!gameOver) {
+    if (!gameOver && clockStarted) {
       clocks[state.turn] = Math.max(0, clocks[state.turn] - (now - clockLast));
       if (clocks[state.turn] === 0) {
         const timedOut = state.turn;
@@ -718,21 +841,50 @@
       if (!AudioCtx) return;
       audioContext ||= new AudioCtx();
       if (audioContext.state === 'suspended') audioContext.resume();
-      const now = audioContext.currentTime;
-      const gain = audioContext.createGain();
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(kind === 'end' ? 0.12 : 0.075, now + 0.008);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + (kind === 'end' ? 0.42 : 0.13));
-      gain.connect(audioContext.destination);
-      const frequencies = kind === 'capture' ? [180,120] : kind === 'end' ? [440,330] : [260,210];
-      frequencies.forEach((frequency,index) => {
+      const ctx = audioContext;
+      const now = ctx.currentTime;
+      const master = ctx.createGain();
+      master.gain.setValueAtTime(0.82,now);
+      const compressor = ctx.createDynamicsCompressor();
+      compressor.threshold.setValueAtTime(-20,now);
+      compressor.ratio.setValueAtTime(5,now);
+      master.connect(compressor); compressor.connect(ctx.destination);
+
+      function impact(delay, strength, pitch) {
+        const start = now + delay;
+        const body = ctx.createGain();
+        body.gain.setValueAtTime(0.0001,start);
+        body.gain.exponentialRampToValueAtTime(strength,start+0.004);
+        body.gain.exponentialRampToValueAtTime(0.0001,start+0.16);
+        body.connect(master);
         const oscillator = audioContext.createOscillator();
-        oscillator.type = 'sine';
-        oscillator.frequency.setValueAtTime(frequency, now + index * 0.045);
-        oscillator.connect(gain);
-        oscillator.start(now + index * 0.045);
-        oscillator.stop(now + (kind === 'end' ? 0.42 : 0.13));
-      });
+        oscillator.type = 'triangle';
+        oscillator.frequency.setValueAtTime(pitch,start);
+        oscillator.frequency.exponentialRampToValueAtTime(Math.max(45,pitch*0.42),start+0.11);
+        oscillator.connect(body); oscillator.start(start); oscillator.stop(start+0.17);
+
+        const length = Math.floor(ctx.sampleRate*0.055);
+        const buffer = ctx.createBuffer(1,length,ctx.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i=0;i<length;i++) data[i]=(Math.random()*2-1)*Math.pow(1-i/length,3);
+        const noise = ctx.createBufferSource(); noise.buffer = buffer;
+        const filter = ctx.createBiquadFilter(); filter.type='bandpass'; filter.frequency.setValueAtTime(1150,start); filter.Q.setValueAtTime(.7,start);
+        const click = ctx.createGain(); click.gain.setValueAtTime(strength*.62,start); click.gain.exponentialRampToValueAtTime(0.0001,start+0.055);
+        noise.connect(filter); filter.connect(click); click.connect(master); noise.start(start);
+      }
+
+      function accent(delay, frequency) {
+        const start=now+delay, gain=ctx.createGain(), oscillator=ctx.createOscillator();
+        gain.gain.setValueAtTime(0.0001,start); gain.gain.exponentialRampToValueAtTime(.09,start+.008); gain.gain.exponentialRampToValueAtTime(.0001,start+.22);
+        oscillator.type='square'; oscillator.frequency.setValueAtTime(frequency,start);
+        oscillator.connect(gain); gain.connect(master); oscillator.start(start); oscillator.stop(start+.23);
+      }
+
+      if (kind === 'capture') { impact(0,.22,145); impact(.055,.15,92); }
+      else if (kind === 'castle') { impact(0,.16,170); impact(.105,.18,140); }
+      else if (kind === 'check') { impact(0,.19,150); accent(.075,620); }
+      else if (kind === 'end') { impact(0,.2,135); accent(.08,420); accent(.25,315); }
+      else impact(0,.18,175);
     } catch (_) { /* 音效不可用時不影響棋局。 */ }
   }
 
@@ -854,13 +1006,16 @@
 
   function commitMove(move) {
     if (!tickClock()) return false;
+    const startsClock = !clockStarted && gameMoves.length === 0 && state.turn === 'w';
     const before = cloneState(state);
     const text = moveText(state,move);
     const capture = !!state.board[move.to.r][move.to.c] || move.enPassant;
     state = applyMove(state,move);
     gameMoves.push({ before, move: JSON.parse(JSON.stringify(move)), text });
+    if (startsClock) clockStarted = true;
     clockLast = performance.now();
-    playSound(capture ? 'capture' : 'move');
+    const sound = inCheck(state,state.turn) ? 'check' : move.castle ? 'castle' : capture ? 'capture' : 'move';
+    playSound(sound);
     return true;
   }
 
@@ -868,10 +1023,15 @@
     if (gameOver || state.turn !== 'b') return;
     aiThinking = true; render();
     const token = gameToken;
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const thinkStarted = performance.now();
+    const minimumThink = { easy:1400, medium:2500, hard:4500 }[activeDifficulty];
+    await new Promise(resolve => setTimeout(resolve, 40));
     if (token !== gameToken || gameOver) return;
     const move = chooseAiMove(state,activeDifficulty);
     if (token !== gameToken || gameOver || !move) return;
+    const remaining = minimumThink-(performance.now()-thinkStarted);
+    if (remaining > 0) await new Promise(resolve => setTimeout(resolve,remaining));
+    if (token !== gameToken || gameOver) return;
     if (!commitMove(move)) return;
     aiThinking = false; render();
     const result = gameResult(state);
@@ -881,7 +1041,7 @@
   function restartGame() {
     gameToken++; state = initialState(); activeDifficulty = ui.difficulty.value;
     gameMoves = []; selected = null; selectedMoves = []; gameOver = false; aiThinking = false;
-    clocks = { w: 10 * 60 * 1000, b: 10 * 60 * 1000 }; clockLast = performance.now();
+    clocks = { w: 10 * 60 * 1000, b: 10 * 60 * 1000 }; clockStarted = false; clockLast = performance.now();
     const name = { easy:'簡單', medium:'中等', hard:'困難' }[activeDifficulty];
     ui.difficultyHelp.textContent = `難度會在下一局套用；目前：${name}`;
     if (ui.dialog.open) ui.dialog.close();
@@ -923,7 +1083,7 @@
   setInterval(tickClock, 250);
 
   // 僅供本機自動化驗證；不影響遊戲操作。
-  window.__CHESSLITE__ = { initialState, cloneState, positionKey, applyMove, legalMovesForSquare, allLegalMoves, inCheck, gameResult, insufficientMaterial };
+  window.__CHESSLITE__ = { initialState, cloneState, positionKey, applyMove, legalMovesForSquare, allLegalMoves, inCheck, gameResult, insufficientMaterial, chooseAiMove };
   </script>
 </body>
 </html>
