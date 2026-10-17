@@ -66,7 +66,8 @@
       width: 100%;
       aspect-ratio: 1;
       display: grid;
-      grid-template-columns: repeat(8, 1fr);
+      grid-template-columns: repeat(8, minmax(0, 1fr));
+      grid-template-rows: repeat(8, minmax(0, 1fr));
       overflow: hidden;
       border-radius: 4px;
       position: relative;
@@ -76,6 +77,7 @@
       border: 0;
       padding: 0;
       min-width: 0;
+      min-height: 0;
       position: relative;
       display: grid;
       place-items: center;
@@ -170,6 +172,18 @@
     #status.thinking::after { content: ""; animation: dots 1.2s steps(4,end) infinite; }
     @keyframes dots { 0% { content: "" } 25% { content: "." } 50% { content: ".." } 75%,100% { content: "..." } }
 
+    .clocks { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-bottom: 16px; }
+    .clock {
+      padding: 10px 12px;
+      border: 1px solid #d5dbd6;
+      border-radius: 9px;
+      background: #f5f4ef;
+      color: var(--muted);
+    }
+    .clock.active { border-color: var(--green-dark); background: #e9f0e9; color: var(--ink); }
+    .clock-name { display: block; font-size: .72rem; font-weight: 700; }
+    .clock-time { display: block; margin-top: 2px; font: 760 1.25rem ui-monospace, SFMono-Regular, Consolas, monospace; }
+
     label { display: block; font-size: .84rem; font-weight: 700; margin-bottom: 6px; }
     select, .action {
       width: 100%;
@@ -182,9 +196,10 @@
     }
     select { margin-bottom: 5px; }
     .help { color: var(--muted); font-size: .76rem; margin: 0 0 15px; line-height: 1.4; }
-    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
-    .action { cursor: pointer; font-weight: 700; }
+    .actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; }
+    .action { cursor: pointer; font-weight: 700; font-size: .92rem; padding: 0 8px; white-space: nowrap; }
     .action.primary { color: white; background: var(--green-dark); border-color: var(--green-dark); }
+    .action.danger { color: #a33b3b; border-color: #d9b8b8; }
     .action:hover:not(:disabled) { transform: translateY(-1px); }
     .action:disabled { opacity: .43; cursor: not-allowed; }
 
@@ -242,7 +257,7 @@
   <main class="app">
     <header>
       <h1>ChessLite</h1>
-      <p class="subtitle">一場安靜、離線的西洋棋對局</p>
+      <p class="subtitle">一場俐落、離線的西洋棋對局</p>
     </header>
     <div class="layout">
       <section class="board-shell" aria-label="西洋棋盤">
@@ -252,6 +267,10 @@
         <div class="status-card" aria-live="polite">
           <span class="status-label">對局狀態</span>
           <span id="status">玩家回合</span>
+        </div>
+        <div class="clocks" aria-label="雙方剩餘時間">
+          <div id="whiteClockBox" class="clock active"><span class="clock-name">玩家・白方</span><span id="whiteClock" class="clock-time">10:00</span></div>
+          <div id="blackClockBox" class="clock"><span class="clock-name">AI・黑方</span><span id="blackClock" class="clock-time">10:00</span></div>
         </div>
         <label for="difficulty">AI 難度</label>
         <select id="difficulty">
@@ -263,6 +282,7 @@
         <div class="actions">
           <button id="restart" class="action primary" type="button">重新開始</button>
           <button id="undo" class="action" type="button" disabled>悔棋</button>
+          <button id="resign" class="action danger" type="button">投降</button>
         </div>
         <h2 class="moves-title">走棋紀錄</h2>
         <div id="moves" class="moves" aria-label="走棋紀錄"><div class="empty">尚未走棋</div></div>
@@ -621,14 +641,19 @@
   const ui = {
     board: document.getElementById('board'), status: document.getElementById('status'),
     moves: document.getElementById('moves'), undo: document.getElementById('undo'),
-    restart: document.getElementById('restart'), difficulty: document.getElementById('difficulty'),
+    restart: document.getElementById('restart'), resign: document.getElementById('resign'), difficulty: document.getElementById('difficulty'),
     difficultyHelp: document.getElementById('difficultyHelp'), dialog: document.getElementById('promotionDialog'),
-    promotionOptions: document.getElementById('promotionOptions')
+    promotionOptions: document.getElementById('promotionOptions'),
+    whiteClock: document.getElementById('whiteClock'), blackClock: document.getElementById('blackClock'),
+    whiteClockBox: document.getElementById('whiteClockBox'), blackClockBox: document.getElementById('blackClockBox')
   };
   let state = initialState();
   let activeDifficulty = 'medium';
   let selected = null, selectedMoves = [], gameMoves = [], gameOver = false, aiThinking = false, gameToken = 0;
   let drag = null, suppressClick = false;
+  let clocks = { w: 10 * 60 * 1000, b: 10 * 60 * 1000 };
+  let clockLast = performance.now();
+  let audioContext = null;
 
   function render() {
     const checkedKing = inCheck(state,state.turn) ? findKing(state,state.turn) : null;
@@ -655,6 +680,60 @@
     }
     renderMoves(); updateStatus();
     ui.undo.disabled = !gameMoves.length;
+    ui.resign.disabled = gameOver;
+    renderClocks();
+  }
+
+  function formatClock(ms) {
+    const safe = Math.max(0, Math.ceil(ms / 1000));
+    return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2,'0')}`;
+  }
+
+  function renderClocks() {
+    ui.whiteClock.textContent = formatClock(clocks.w);
+    ui.blackClock.textContent = formatClock(clocks.b);
+    ui.whiteClockBox.classList.toggle('active', !gameOver && state.turn === 'w');
+    ui.blackClockBox.classList.toggle('active', !gameOver && state.turn === 'b');
+  }
+
+  function tickClock() {
+    const now = performance.now();
+    if (!gameOver) {
+      clocks[state.turn] = Math.max(0, clocks[state.turn] - (now - clockLast));
+      if (clocks[state.turn] === 0) {
+        const timedOut = state.turn;
+        clockLast = now;
+        setFinalStatus({ type: 'timeout', winner: opposite(timedOut) });
+        return false;
+      }
+    }
+    clockLast = now;
+    renderClocks();
+    return true;
+  }
+
+  function playSound(kind = 'move') {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      audioContext ||= new AudioCtx();
+      if (audioContext.state === 'suspended') audioContext.resume();
+      const now = audioContext.currentTime;
+      const gain = audioContext.createGain();
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(kind === 'end' ? 0.12 : 0.075, now + 0.008);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + (kind === 'end' ? 0.42 : 0.13));
+      gain.connect(audioContext.destination);
+      const frequencies = kind === 'capture' ? [180,120] : kind === 'end' ? [440,330] : [260,210];
+      frequencies.forEach((frequency,index) => {
+        const oscillator = audioContext.createOscillator();
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(frequency, now + index * 0.045);
+        oscillator.connect(gain);
+        oscillator.start(now + index * 0.045);
+        oscillator.stop(now + (kind === 'end' ? 0.42 : 0.13));
+      });
+    } catch (_) { /* 音效不可用時不影響棋局。 */ }
   }
 
   function renderMoves() {
@@ -676,12 +755,17 @@
   }
 
   function setFinalStatus(result) {
+    if (gameOver) return;
     gameOver = true; aiThinking = false; selected = null; selectedMoves = [];
     const labels = {
       stalemate: '逼和｜和棋', insufficient: '棋力不足｜和棋',
-      fifty: '50 回合規則｜和棋', repetition: '三次重複局面｜和棋'
+      fifty: '50 回合規則｜和棋', repetition: '三次重複局面｜和棋',
+      timeout: result.winner === 'w' ? 'AI 超時｜玩家勝利' : '玩家超時｜AI 勝利',
+      resign: '玩家投降｜AI 勝利'
     };
     ui.status.textContent = result.type === 'checkmate' ? (result.winner === 'w' ? '將死｜玩家勝利' : '將死｜AI 勝利') : labels[result.type];
+    gameToken++;
+    playSound('end');
     render();
   }
 
@@ -761,7 +845,7 @@
   async function playerMove(candidates) {
     let move = candidates[0];
     if (candidates.length > 1 && candidates.some(m => m.promotion)) move = await choosePromotion(candidates);
-    commitMove(move);
+    if (!commitMove(move)) return;
     selected = null; selectedMoves = []; render();
     const result = gameResult(state);
     if (result.over) { setFinalStatus(result); return; }
@@ -769,21 +853,27 @@
   }
 
   function commitMove(move) {
+    if (!tickClock()) return false;
     const before = cloneState(state);
     const text = moveText(state,move);
+    const capture = !!state.board[move.to.r][move.to.c] || move.enPassant;
     state = applyMove(state,move);
     gameMoves.push({ before, move: JSON.parse(JSON.stringify(move)), text });
+    clockLast = performance.now();
+    playSound(capture ? 'capture' : 'move');
+    return true;
   }
 
   async function startAiTurn() {
     if (gameOver || state.turn !== 'b') return;
     aiThinking = true; render();
     const token = gameToken;
-    await new Promise(resolve => setTimeout(resolve, 90));
+    await new Promise(resolve => setTimeout(resolve, 1000));
     if (token !== gameToken || gameOver) return;
     const move = chooseAiMove(state,activeDifficulty);
     if (token !== gameToken || gameOver || !move) return;
-    commitMove(move); aiThinking = false; render();
+    if (!commitMove(move)) return;
+    aiThinking = false; render();
     const result = gameResult(state);
     if (result.over) setFinalStatus(result);
   }
@@ -791,6 +881,7 @@
   function restartGame() {
     gameToken++; state = initialState(); activeDifficulty = ui.difficulty.value;
     gameMoves = []; selected = null; selectedMoves = []; gameOver = false; aiThinking = false;
+    clocks = { w: 10 * 60 * 1000, b: 10 * 60 * 1000 }; clockLast = performance.now();
     const name = { easy:'簡單', medium:'中等', hard:'困難' }[activeDifficulty];
     ui.difficultyHelp.textContent = `難度會在下一局套用；目前：${name}`;
     if (ui.dialog.open) ui.dialog.close();
@@ -808,11 +899,20 @@
       const entry = gameMoves.pop();
       state = cloneState(entry.before);
     }
+    clockLast = performance.now();
     render();
+  }
+
+  function resignGame() {
+    if (gameOver) return;
+    if (!tickClock()) return;
+    if (window.confirm('確定要投降並結束本局嗎？')) setFinalStatus({ type: 'resign', winner: 'b' });
+    else clockLast = performance.now();
   }
 
   ui.restart.addEventListener('click', restartGame);
   ui.undo.addEventListener('click', undoMoves);
+  ui.resign.addEventListener('click', resignGame);
   ui.difficulty.addEventListener('change', () => {
     const pending = { easy:'簡單', medium:'中等', hard:'困難' }[ui.difficulty.value];
     const current = { easy:'簡單', medium:'中等', hard:'困難' }[activeDifficulty];
@@ -820,6 +920,7 @@
   });
 
   render();
+  setInterval(tickClock, 250);
 
   // 僅供本機自動化驗證；不影響遊戲操作。
   window.__CHESSLITE__ = { initialState, cloneState, positionKey, applyMove, legalMovesForSquare, allLegalMoves, inCheck, gameResult, insufficientMaterial };
