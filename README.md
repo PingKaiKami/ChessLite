@@ -2,6 +2,8 @@
 
 ChessLite 是一款可直接在瀏覽器離線遊玩的單機西洋棋。玩家執白棋，與內建的純 JavaScript AI 對戰，不需要安裝套件、啟動伺服器或連接網路。
 
+線上遊玩：<https://pingkaikami.github.io/ChessLite/>
+
 ## 開始遊玩
 
 1. 下載專案中的 `index.html`。
