@@ -844,10 +844,10 @@
       const ctx = audioContext;
       const now = ctx.currentTime;
       const master = ctx.createGain();
-      master.gain.setValueAtTime(1.35,now);
+      master.gain.setValueAtTime(2.4,now);
       const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.setValueAtTime(-12,now);
-      compressor.ratio.setValueAtTime(3.5,now);
+      compressor.threshold.setValueAtTime(-3,now);
+      compressor.ratio.setValueAtTime(12,now);
       master.connect(compressor); compressor.connect(ctx.destination);
 
       function impact(delay, strength, pitch) {
@@ -863,19 +863,30 @@
         oscillator.frequency.exponentialRampToValueAtTime(Math.max(45,pitch*0.42),start+0.11);
         oscillator.connect(body); oscillator.start(start); oscillator.stop(start+0.17);
 
+        const presence = ctx.createGain();
+        presence.gain.setValueAtTime(0.0001,start);
+        presence.gain.exponentialRampToValueAtTime(strength*.78,start+0.003);
+        presence.gain.exponentialRampToValueAtTime(0.0001,start+0.105);
+        presence.connect(master);
+        const mid = ctx.createOscillator();
+        mid.type = 'triangle';
+        mid.frequency.setValueAtTime(pitch*3.2,start);
+        mid.frequency.exponentialRampToValueAtTime(pitch*1.55,start+0.09);
+        mid.connect(presence); mid.start(start); mid.stop(start+0.11);
+
         const length = Math.floor(ctx.sampleRate*0.055);
         const buffer = ctx.createBuffer(1,length,ctx.sampleRate);
         const data = buffer.getChannelData(0);
         for (let i=0;i<length;i++) data[i]=(Math.random()*2-1)*Math.pow(1-i/length,3);
         const noise = ctx.createBufferSource(); noise.buffer = buffer;
         const filter = ctx.createBiquadFilter(); filter.type='bandpass'; filter.frequency.setValueAtTime(1150,start); filter.Q.setValueAtTime(.7,start);
-        const click = ctx.createGain(); click.gain.setValueAtTime(strength*.62,start); click.gain.exponentialRampToValueAtTime(0.0001,start+0.055);
+        const click = ctx.createGain(); click.gain.setValueAtTime(strength*1.1,start); click.gain.exponentialRampToValueAtTime(0.0001,start+0.065);
         noise.connect(filter); filter.connect(click); click.connect(master); noise.start(start);
       }
 
       function accent(delay, frequency) {
         const start=now+delay, gain=ctx.createGain(), oscillator=ctx.createOscillator();
-        gain.gain.setValueAtTime(0.0001,start); gain.gain.exponentialRampToValueAtTime(.09,start+.008); gain.gain.exponentialRampToValueAtTime(.0001,start+.22);
+        gain.gain.setValueAtTime(0.0001,start); gain.gain.exponentialRampToValueAtTime(.15,start+.008); gain.gain.exponentialRampToValueAtTime(.0001,start+.22);
         oscillator.type='square'; oscillator.frequency.setValueAtTime(frequency,start);
         oscillator.connect(gain); gain.connect(master); oscillator.start(start); oscillator.stop(start+.23);
       }
